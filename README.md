@@ -19,7 +19,7 @@ Modelos exportados diretamente de geradores 3D por IA costumam apresentar defeit
 
 ## 2. Como Funciona o Pipeline (7 Etapas)
 
-O script [`reparar_stl.py`](file:///C:/Magno/Projetos/reparar_stl.py) executa automaticamente o seguinte fluxo sem depender de softwares externos (não exige Blender):
+O script `reparar_stl.py` executa automaticamente o seguinte fluxo sem depender de softwares externos (não exige Blender):
 
 1. **Reorientação Inteligente (`orientar_malha`):** Detecta automaticamente se a peça está no padrão *Y-Up* do ComfyUI e rotaciona para o padrão *Z-Up* dos fatiadores 3D.
 2. **Limpeza de Fragmentos (`filtrar_fragmentos_isolados`):** Analisa os componentes conectados da malha e descarta ilhas flutuantes isoladas (mantendo apenas o corpo principal e partes legítimas que representem ao menos 1% das faces ou 0,5% da altura).
@@ -42,10 +42,8 @@ O script [`reparar_stl.py`](file:///C:/Magno/Projetos/reparar_stl.py) executa au
 
 | Arquivo | Função |
 | :--- | :--- |
-| [`reparar_stl.py`](file:///C:/Magno/Projetos/reparar_stl.py) | Script principal em Python com todo o motor de reparo volumétrico, realce 3D e validação manifold. |
-| [`reparar_stl.bat`](file:///C:/Magno/Projetos/reparar_stl.bat) | Atalho para Windows que executa o script usando automaticamente o Python embutido do ComfyUI (`M:\ComfyUI\python_embeded\python.exe`). Aceita *Drag & Drop* (arrastar e soltar arquivo `.stl`). |
-
-> **Nota sobre dependências:** O utilitário é 100% autônomo em cima do `M:\ComfyUI\python_embeded\python.exe` (`numpy`, `scipy`, `trimesh`, `scikit-image`, `manifold3d`) e **não requer Blender instalado**.
+| `reparar_stl.py` | Script principal em Python com todo o motor de reparo volumétrico, realce 3D e validação manifold. |
+| `reparar_stl.bat` | Atalho para Windows que executa o script usando automaticamente o Python.  |
 
 ---
 
@@ -54,19 +52,14 @@ O script [`reparar_stl.py`](file:///C:/Magno/Projetos/reparar_stl.py) executa au
 ### Sintaxe Básica (usando o `.bat`)
 
 ```bat
-C:\Magno\Projetos\reparar_stl.bat <arquivo_entrada.stl> [opções]
+reparar_stl.bat <arquivo_entrada.stl> [opções]
 ```
 
 ### Sintaxe Direta (chamando o Python do ComfyUI)
 
 ```powershell
-M:\ComfyUI\python_embeded\python.exe C:\Magno\Projetos\reparar_stl.py <arquivo_entrada.stl> [opções]
+python.exe reparar_stl.py <arquivo_entrada.stl> [opções]
 ```
-
-### Uso Rápido por Arrastar e Soltar (*Drag & Drop*)
-Basta arrastar qualquer arquivo `.stl` no Windows Explorer e soltar em cima do ícone [`reparar_stl.bat`](file:///C:/Magno/Projetos/reparar_stl.bat). Ele gerará automaticamente o arquivo `<nome>_reparado.stl` na mesma pasta, com `75 mm` de altura padrão e realce de detalhes ativado.
-
----
 
 ## 5. Tabela de Opções da Linha de Comando
 
@@ -95,29 +88,29 @@ Basta arrastar qualquer arquivo `.stl` no Windows Explorer e soltar em cima do �
 ### Exemplo 1: Igualar a base da peça à base de um arquivo de referência (`referencia.stl`)
 Ideal quando você tem uma base/pedestal padrão e quer que a nova miniatura tenha exatamente o mesmo diâmetro de base:
 ```bat
-C:\Magno\Projetos\reparar_stl.bat C:\Magno\Projetos\all.stl --referencia C:\Magno\Projetos\referencia.stl --escala-ref base --diagnostico
+reparar_stl.bat all.stl --referencia referencia.stl --escala-ref base --diagnostico
 ```
 
 ### Exemplo 2: Igualar a altura total à altura de um arquivo de referência
 ```bat
-C:\Magno\Projetos\reparar_stl.bat C:\Magno\Projetos\all.stl --referencia C:\Magno\Projetos\referencia.stl --escala-ref altura -o C:\Magno\Projetos\all_altura_ref.stl
+reparar_stl.bat all.stl --referencia referencia.stl --escala-ref altura -o all_altura_ref.stl
 ```
 
 ### Exemplo 3: Reparar uma peça SEM base (apoiada nas pernas/pés) definindo altura de 65 mm
 O algoritmo fecha o interior oco das pernas e do tronco **sem fechar o espaço vazio entre as pernas**:
 ```bat
-C:\Magno\Projetos\reparar_stl.bat C:\Magno\Projetos\personagem_sem_base.stl --altura 65
+reparar_stl.bat personagem_sem_base.stl --altura 65
 ```
 
 ### Exemplo 4: Miniatura pequena de RPG (35 mm) com realce forte de rosto (olhos, nariz e boca)
 Para peças muito pequenas impressas em bico `0.4 mm`, aumentar `--realce` para `0.95` e `--espessura-minima` para `0.55` destaca ainda mais as feições no fatiador:
 ```bat
-C:\Magno\Projetos\reparar_stl.bat C:\Magno\Projetos\goblin.stl --altura 35 --realce 0.95 --espessura-minima 0.55 --diagnostico
+reparar_stl.bat goblin.stl --altura 35 --realce 0.95 --espessura-minima 0.55 --diagnostico
 ```
 
 ### Exemplo 5: Peça suspensa ou arredondada embaixo (sem achatar o fundo em Z=0)
 ```bat
-C:\Magno\Projetos\reparar_stl.bat C:\Magno\Projetos\orbe_flutuante.stl --altura 50 --base preservar
+reparar_stl.bat orbe_flutuante.stl --altura 50 --base preservar
 ```
 
 ---
