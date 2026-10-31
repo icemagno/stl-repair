@@ -4,6 +4,9 @@ Documentação oficial do utilitário de pós-processamento geométrico desenvol
 
 ---
 
+<img width="3000" height="1500" alt="elf-v1_diagnostico" src="https://github.com/user-attachments/assets/cc86441c-8ea5-471e-8e92-848ede34b0a1" />
+
+
 ## 1. Problemas Resolvidos pelo Utilitário
 
 Modelos exportados diretamente de geradores 3D por IA costumam apresentar defeitos severos que impedem ou arruínam a impressão 3D:
