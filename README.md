@@ -125,3 +125,40 @@ Para aproveitar ao máximo os detalhes faciais realçados pelo script usando um 
 1. **Gerador de Paredes (*Wall Generator*):** Ative o modo **Arachne** (no lugar de *Classic*). O Arachne varia dinamicamente a largura de extrusão entre `0.28 mm` e `0.50 mm`, permitindo desenhar narinas, pálpebras e pontas finas com muito mais precisão.
 2. **Altura de Camada (*Layer Height*):** Use **`0.12 mm`** (ou **Altura de Camada Variável / Adaptativa** entre `0.08 mm` no rosto e `0.16 mm` na base). Como a resolução vertical (eixo Z) depende apenas do motor de passo Z e não do diâmetro do bico, camadas de `0.08 mm`–`0.12 mm` revelam perfeitamente a curvatura dos olhos e lábios.
 3. **Ordem das Paredes (*Wall Printing Order*):** Use **Inner/Outer** (Interna/Externa) ou **Inner/Outer/Inner** para melhorar a precisão dimensional dos micro-relevos externos.
+
+```
+========================================================================
+INICIANDO REPARO E REALCE 3D: hero-01.stl
+========================================================================
+  [ANTES DO REPARO (Original)]
+    Vértices / Faces     : 342,564 / 698,687
+    Dimensões (X, Y, Z)  : 0.447 x 0.999 x 0.252
+    Componentes (Ilhas)  : 270
+    Arestas Abertas      : 27
+    Arestas Não-Manifold : 5,132
+    Estanque (Manifold)  : NÃO
+    Volume / Área        : 0.0037 / 2.3425
+  -> Orientação: convertendo Y-up (padrão ComfyUI) para Z-up (padrão Slicer)
+  -> Fragmentos isolados removidos: 269 (restaram 689,820 faces na peça)
+  -> Executando preenchimento sólido 3D de alta resolução...
+  -> Grade volumétrica 3D: 550 x 550 x 1000 (dx=0.00085, dy=0.00049, dz=0.00102)
+  -> Extraindo superfície estanque, cravando detalhes originais e aplicando realce 3D...
+  -> Triângulos externos de referência identificados: 244,197
+  -> Aplicando Realce de Micro-Detalhes 3D (intensidade=0.65) para olhos, nariz e relevos...
+  -> Otimizando malha em C++ via manifold3d.simplify (4,513,862 faces, tol=0.000069)...
+  -> Malha 2-manifold otimizada: 1,983,396 faces
+  -> Escalando para altura final de 65.00 mm (fator 65.03x)
+------------------------------------------------------------------------
+  [DEPOIS DO REPARO (Final)]
+    Vértices / Faces     : 991,672 / 1,983,396
+    Dimensões (X, Y, Z)  : 29.145 x 16.444 x 65.000
+    Componentes (Ilhas)  : 1
+    Arestas Abertas      : 0
+    Arestas Não-Manifold : 0
+    Estanque (Manifold)  : SIM
+    Volume / Área        : 4714.3171 / 4485.8682
+------------------------------------------------------------------------
+Arquivo STL salvo com sucesso em: hero-01_reparado.stl (99.17 MB)
+Tempo total: 285.3s
+```
+
