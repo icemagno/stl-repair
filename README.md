@@ -3,7 +3,8 @@
 Documentação oficial do utilitário de pós-processamento geométrico desenvolvido para transformar malhas 3D brutas geradas por IA no **ComfyUI** (Hunyuan3D, TripoSR, Trellis, CRM, etc.) em **sólidos 100% estanques (*watertight 2-manifold*)**, prontos para fatiamento e impressão 3D no **Orca Slicer** e **Creality Print**.
 
 ---
-
+<img width="957" height="791" alt="pic-01" src="https://github.com/user-attachments/assets/f5ae0931-b222-4bfc-a04e-b5ecfeec1150" />
+<img width="1583" height="1006" alt="pic-02" src="https://github.com/user-attachments/assets/080dc3e6-72a6-4085-920a-9e983ce4133c" />
 <img width="3000" height="1500" alt="elf-v1_diagnostico" src="https://github.com/user-attachments/assets/cc86441c-8ea5-471e-8e92-848ede34b0a1" />
 
 
