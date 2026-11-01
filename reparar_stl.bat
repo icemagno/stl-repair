@@ -5,7 +5,7 @@ set "SCRIPT_PY=%~dp0reparar_stl.py"
 
 if "%~1"=="" (
     echo ========================================================================
-    echo Utilitario de Reparo STL v2.0 ^(Alta Fidelidade Estrutural^)
+    echo Utilitario de Reparo STL v2.6 ^(Alta Fidelidade e Acabamento Liso^)
     echo Uso:
     echo   .\reparar_stl.bat arquivo.stl [opcoes]
     echo   Ou arraste um arquivo .stl para cima deste icone no Windows Explorer!

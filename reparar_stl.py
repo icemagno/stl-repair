@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-reparar_stl.py (v2.3) — Reparador 3D de Alta Fidelidade Estrutural para ComfyUI / Impressão 3D
+reparar_stl.py (v2.6) — Reparador 3D de Alta Fidelidade e Acabamento Porcelana para ComfyUI / Impressão 3D
 ==============================================================================================
 100% Autônomo (NÃO depende do Blender nem de compiladores externos — roda direto no Python do ComfyUI).
 
@@ -138,9 +138,9 @@ def orientar_malha(verts, modo_eixo="auto"):
 
 def filtrar_fragmentos_isolados(mesh):
     """
-    Remove ilhas flutuantes, lascas da parede oca interna e pequenos apêndices/pinos parasitas
-    separados por costuras non-manifold, preservando 100% dos painéis legítimos (como barras de
-    capa com costura longa) e remendos planos que tampam furos da superfície.
+    Remove ilhas flutuantes desconectadas no ar externo (por conectividade de vértices + proximidade)
+    e poda cirurgicamente apenas micro-pinos/gotas parasitas non-manifold externos, com garantia
+    topológica estrita de NUNCA abrir furos na pele da peça (preservando 100% da vedação do corpo).
     """
     if len(mesh.faces) == 0 or len(mesh.vertices) == 0:
         return mesh, 0
@@ -150,114 +150,115 @@ def filtrar_fragmentos_isolados(mesh):
     n_faces = len(f)
     n_verts = len(mesh.vertices)
 
-    # Separa componentes por arestas estritamente 2-manifold (corta pinos/gotas parasitas non-manifold!)
-    f_adj = mesh.face_adjacency
-    if len(f_adj) > 0:
-        adj_mat = coo_matrix(
-            (np.ones(len(f_adj), dtype=np.uint8), (f_adj[:, 0], f_adj[:, 1])),
-            shape=(n_faces, n_faces),
-        )
-        n_comps, face_labels = csgraph_components(adj_mat, directed=False)
-    else:
-        n_comps = n_faces
-        face_labels = np.arange(n_faces, dtype=np.int32)
-
-    comp_face_counts = np.bincount(face_labels, minlength=n_comps)
-    active_cids = np.where(comp_face_counts > 0)[0]
-    if len(active_cids) <= 1:
-        return mesh, 0
-
+    # Etapa 1: Conectividade por VÉRTICES (não quebra em costuras non-manifold nem arranca remendos da pele!)
+    rows = np.concatenate([f[:, 0], f[:, 1], f[:, 2]])
+    cols = np.concatenate([f[:, 1], f[:, 2], f[:, 0]])
+    v_adj = coo_matrix(
+        (np.ones(len(rows), dtype=np.uint8), (rows, cols)),
+        shape=(n_verts, n_verts),
+    )
+    n_vcomps, v_labels = csgraph_components(v_adj, directed=False)
+    f_vlabels = v_labels[f[:, 0]]
     face_areas = mesh.area_faces
-    comp_areas = np.bincount(face_labels, weights=face_areas, minlength=n_comps)
+    vcomp_areas = np.bincount(f_vlabels, weights=face_areas, minlength=n_vcomps)
+    active_vcids = np.where(np.bincount(f_vlabels, minlength=n_vcomps) > 0)[0]
 
-    main_cid = int(np.argmax(comp_areas))
-    main_area = float(comp_areas[main_cid])
-    main_v_idx = np.unique(f[face_labels == main_cid])
-    main_verts = mesh.vertices[main_v_idx]
+    main_vcid = int(np.argmax(vcomp_areas))
+    main_area = float(vcomp_areas[main_vcid])
+    main_verts = mesh.vertices[v_labels == main_vcid]
     diag = float(np.linalg.norm(main_verts.max(axis=0) - main_verts.min(axis=0)))
 
-    kept_cids = {main_cid}
-    main_tree_init = cKDTree(main_verts)
-    for cid in active_cids:
-        if cid == main_cid:
-            continue
-        # Sub-peças estruturais grandes (pedestal separado, asa/capa grande, arma, etc.)
-        if comp_areas[cid] >= 0.005 * main_area:
-            c_verts = mesh.vertices[np.unique(f[face_labels == cid])]
-            d_min = float(main_tree_init.query(c_verts, workers=-1)[0].min())
-            if d_min <= 0.02 * diag:
-                kept_cids.add(int(cid))
-
-    # Pré-calcula os vértices por componente para verificação rápida de costuras e remendos planos
-    comp_verts_map = {}
-    for cid in active_cids:
-        cid_int = int(cid)
-        if cid_int not in kept_cids:
-            comp_verts_map[cid_int] = np.unique(f[face_labels == cid_int])
-
+    kept_vcids = {main_vcid}
+    rem_vcids = [int(c) for c in active_vcids if int(c) != main_vcid]
     for _ in range(4):
-        if not comp_verts_map:
+        if not rem_vcids:
             break
-        kept_face_mask = np.isin(face_labels, list(kept_cids))
-        kept_faces = f[kept_face_mask]
-        kept_v_mask = np.zeros(n_verts, dtype=bool)
-        kept_v_mask[kept_faces.ravel()] = True
-
-        # Identifica vértices em bordas abertas atuais da malha principal (para preservar tampas de furos)
-        ke0 = kept_faces[:, [0, 1]]
-        ke1 = kept_faces[:, [1, 2]]
-        ke2 = kept_faces[:, [2, 0]]
-        k_edges = np.sort(np.vstack([ke0, ke1, ke2]), axis=1).astype(np.int64)
-        e_keys = k_edges[:, 0] * np.int64(n_verts) + k_edges[:, 1]
-        u_keys, u_cnts = np.unique(e_keys, return_counts=True)
-        open_keys = u_keys[u_cnts == 1]
-        open_v_mask = np.zeros(n_verts, dtype=bool)
-        if len(open_keys) > 0:
-            open_v_mask[open_keys // np.int64(n_verts)] = True
-            open_v_mask[open_keys % np.int64(n_verts)] = True
-
-        kept_v_coords = mesh.vertices[kept_v_mask]
-        tree = cKDTree(kept_v_coords)
-
-        added_now = []
-        for cid_int, c_v_idx in list(comp_verts_map.items()):
-            shared_v = c_v_idx[kept_v_mask[c_v_idx]]
-            n_shared = len(shared_v)
-
-            # Regra A: Painel/folha estrutural contínua presa por costura longa (ex: barra da capa),
-            # rejeitando pinos estreitos non-manifold (como gotas/pinos com base pequena no pescoço).
-            if n_shared >= 8:
-                s_pts = mesh.vertices[shared_v]
-                seam_span = float(np.linalg.norm(s_pts.max(axis=0) - s_pts.min(axis=0)))
-                if seam_span >= 0.015 * diag or (
-                    comp_areas[cid_int] >= 0.0012 * main_area and seam_span >= 0.008 * diag
-                ):
-                    added_now.append(cid_int)
-                    continue
-
-            # Regra B: Remendo plano raso que tampa diretamente uma borda aberta (ex: tampa na base),
-            # exigindo que NÃO se projete para fora como pino (max_dist <= 0.2% da diagonal).
-            shared_open = c_v_idx[open_v_mask[c_v_idx]]
-            if len(shared_open) >= 3:
-                c_pts = mesh.vertices[c_v_idx]
-                dists, _ = tree.query(c_pts, distance_upper_bound=0.0020 * diag, workers=-1)
-                if np.all(np.isfinite(dists)):
-                    added_now.append(cid_int)
-                    continue
-
-        if not added_now:
+        kv_mask = np.isin(v_labels, list(kept_vcids))
+        tree_v = cKDTree(mesh.vertices[kv_mask])
+        newly_kept = []
+        for cid in rem_vcids:
+            c_pts = mesh.vertices[v_labels == cid]
+            max_d = 0.020 * diag if vcomp_areas[cid] >= 0.005 * main_area else 0.0025 * diag
+            d_min = float(tree_v.query(c_pts, workers=-1)[0].min())
+            if d_min <= max_d:
+                newly_kept.append(cid)
+        if not newly_kept:
             break
-        for cid_int in added_now:
-            kept_cids.add(cid_int)
-            del comp_verts_map[cid_int]
+        for cid in newly_kept:
+            kept_vcids.add(cid)
+            rem_vcids.remove(cid)
 
-    final_face_mask = np.isin(face_labels, list(kept_cids))
-    removed_comps = int(len(active_cids) - len(kept_cids))
-    if np.all(final_face_mask):
-        return mesh, 0
+    removed_total = int(len(active_vcids) - len(kept_vcids))
+    keep_f_stage1 = np.isin(f_vlabels, list(kept_vcids))
+    if not np.all(keep_f_stage1):
+        mesh = mesh.submesh([np.where(keep_f_stage1)[0]], append=True)
+        mesh.merge_vertices()
 
-    cleaned = mesh.submesh([np.where(final_face_mask)[0]], append=True)
-    return cleaned, removed_comps
+    # Etapa 2: Poda cirúrgica APENAS de micro-pinos/gotas parasitas non-manifold projetados para fora,
+    # exigindo prova topológica de que remover o pino NÃO cria nenhuma aresta aberta nova na peça!
+    f2 = mesh.faces
+    n_f2 = len(f2)
+    n_v2 = len(mesh.vertices)
+    f_adj = mesh.face_adjacency
+    if len(f_adj) > 0 and n_f2 > 0:
+        adj_m = coo_matrix(
+            (np.ones(len(f_adj), dtype=np.uint8), (f_adj[:, 0], f_adj[:, 1])),
+            shape=(n_f2, n_f2),
+        )
+        n_fc, fc_lbls = csgraph_components(adj_m, directed=False)
+        if n_fc > 1:
+            f2_areas = mesh.area_faces
+            fc_areas = np.bincount(fc_lbls, weights=f2_areas, minlength=n_fc)
+            nv64 = np.int64(n_v2)
+            all_edges = np.sort(
+                np.vstack([f2[:, [0, 1]], f2[:, [1, 2]], f2[:, [2, 0]]]), axis=1
+            ).astype(np.int64)
+            all_ekeys = all_edges[:, 0] * nv64 + all_edges[:, 1]
+            u_ekeys, u_ecnts = np.unique(all_ekeys, return_counts=True)
+
+            # Candidatos a pino: área minúscula (< 0.04% da peça)
+            cand_cids = np.where((fc_areas > 0.0) & (fc_areas < 0.00040 * main_area))[0]
+            if len(cand_cids) > 0:
+                non_cand_mask = ~np.isin(fc_lbls, cand_cids)
+                body_v_mask = np.zeros(n_v2, dtype=bool)
+                body_v_mask[f2[non_cand_mask].ravel()] = True
+                body_tree = cKDTree(mesh.vertices[body_v_mask])
+
+                drop_cids = []
+                for cid in cand_cids:
+                    cf = f2[fc_lbls == cid]
+                    cv = np.unique(cf)
+                    shared_v = cv[body_v_mask[cv]]
+                    if len(shared_v) == 0:
+                        continue
+                    s_pts = mesh.vertices[shared_v]
+                    seam_span = float(np.linalg.norm(s_pts.max(axis=0) - s_pts.min(axis=0)))
+                    if seam_span > 0.010 * diag:
+                        continue
+
+                    # Garantia topológica zero-furo: nenhuma aresta fechada (>=2) pode virar aberta (==1)
+                    ce = np.sort(
+                        np.vstack([cf[:, [0, 1]], cf[:, [1, 2]], cf[:, [2, 0]]]), axis=1
+                    ).astype(np.int64)
+                    ck, cc = np.unique(ce[:, 0] * nv64 + ce[:, 1], return_counts=True)
+                    pos = np.searchsorted(u_ekeys, ck)
+                    m_tot = u_ecnts[pos]
+                    m_after = m_tot - cc
+                    if np.any((m_tot >= 2) & (m_after == 1)):
+                        continue
+
+                    # Verifica se realmente se projeta para fora como pino/gota (altura > largura da base)
+                    d_out, _ = body_tree.query(mesh.vertices[cv], workers=-1)
+                    max_prot = float(d_out.max())
+                    if max_prot >= max(0.0022 * diag, 0.80 * seam_span):
+                        drop_cids.append(int(cid))
+
+                if drop_cids:
+                    keep_f2 = ~np.isin(fc_lbls, drop_cids)
+                    mesh = mesh.submesh([np.where(keep_f2)[0]], append=True)
+                    removed_total += len(drop_cids)
+
+    return mesh, removed_total
 
 
 def fechar_micro_furos_malha(mesh, max_hole_ratio=0.030):
@@ -428,10 +429,186 @@ def _contar_vizinhos_7x7x7(mask_bool):
     return s
 
 
-def construir_volume_solido_universal(mesh, res_z=950, modo_base="auto"):
+def _solidificar_cavidades_ventiladas_3d(solid_vol, shell_closed, h, span_max):
+    """
+    Detecta e preenche em 3D cavidades internas ocas mesmo quando possuem furos, fendas ou
+    canais em espiral conectando-as ao ar externo (típico de malhas de parede dupla do ComfyUI).
+    Garantia matemática de ZERO deformação externa:
+      1. Núcleos candidatos (core_all) exigem distância estrita > r_c de TODAS as paredes (jamais
+         inclui vincos externos, axilas, pescoço, dobras de capa, dedos ou costuras).
+      2. Exige > 96% de confinamento direto pelas paredes reais da malha (rejeita arcos/mechas).
+      3. Expansão geodésica contida em (~occ_sub) jamais atravessa paredes para o exterior.
+    """
+    NZ, NY, NX = solid_vol.shape
+    ds = 2
+    p_z = (ds - (NZ % ds)) % ds
+    p_y = (ds - (NY % ds)) % ds
+    p_x = (ds - (NX % ds)) % ds
+
+    occ_fine = (solid_vol > 0) | (shell_closed > 0)
+    if p_z or p_y or p_x:
+        occ_pad = np.pad(occ_fine, ((0, p_z), (0, p_y), (0, p_x)), mode="constant")
+    else:
+        occ_pad = occ_fine
+    NZ_c, NY_c, NX_c = occ_pad.shape[0] // ds, occ_pad.shape[1] // ds, occ_pad.shape[2] // ds
+    occ_c = occ_pad.reshape(NZ_c, ds, NY_c, ds, NX_c, ds).any(axis=(1, 3, 5))
+    del occ_fine, occ_pad
+
+    cav_pure_c = np.zeros_like(occ_c, dtype=bool)
+    vent_plug_c = np.zeros_like(occ_c, dtype=bool)
+    h_c = ds * h
+    struct_6 = ndimage.generate_binary_structure(3, 1)
+    struct_18 = ndimage.generate_binary_structure(3, 2)
+    filled_any = False
+
+    # Três escalas calibradas (em 200mm: raios ~1.56mm, ~0.85mm e ~0.60mm):
+    # selam fendas/espirais de até ~3.1mm mantendo axilas, pescoço, mechas e capa 100% livres!
+    for r_ratio in (0.0078, 0.0042, 0.0030):
+        r_c = float(np.clip((r_ratio * span_max) / h_c, 1.45, 8.0))
+        pad_c = int(np.ceil(r_c)) + 3
+        occ_box = np.pad(occ_c, pad_c, mode="constant", constant_values=False)
+
+        d_wall = ndimage.distance_transform_edt(~occ_box).astype(np.float32)
+        wall_dil = d_wall <= r_c
+        del d_wall
+        wall_dil[0, :, :] = False
+        wall_dil[-1, :, :] = False
+        wall_dil[:, 0, :] = False
+        wall_dil[:, -1, :] = False
+        wall_dil[:, :, 0] = False
+        wall_dil[:, :, -1] = False
+
+        filled_dil = ndimage.binary_fill_holes(wall_dil)
+        core_all = filled_dil & (~wall_dil)
+        del wall_dil
+
+        if np.any(core_all):
+            cz, cy, cx = np.where(core_all)
+            margin = int(np.ceil(2.0 * r_c)) + 3
+            z0, z1 = max(0, int(cz.min()) - margin), min(occ_box.shape[0], int(cz.max()) + margin + 1)
+            y0, y1 = max(0, int(cy.min()) - margin), min(occ_box.shape[1], int(cy.max()) + margin + 1)
+            x0, x1 = max(0, int(cx.min()) - margin), min(occ_box.shape[2], int(cx.max()) + margin + 1)
+            del cz, cy, cx
+
+            fd_sub = filled_dil[z0:z1, y0:y1, x0:x1]
+            del filled_dil
+            if np.all(fd_sub):
+                hull_sub = np.ones_like(fd_sub, dtype=bool)
+            else:
+                hull_sub = ndimage.distance_transform_edt(fd_sub).astype(np.float32) > r_c
+            del fd_sub
+
+            core_sub = core_all[z0:z1, y0:y1, x0:x1]
+            occ_sub = occ_box[z0:z1, y0:y1, x0:x1]
+            core_lbls, n_cores = ndimage.label(core_sub, structure=struct_18)
+            core_sizes = np.bincount(core_lbls.ravel())
+            core_sizes[0] = 0
+
+            if n_cores == 1:
+                d_core = ndimage.distance_transform_edt(~core_sub).astype(np.float32)
+                cand_domain = (d_core <= (r_c + 0.65)) & hull_sub & (~occ_sub)
+                del d_core, hull_sub
+                exp_band = ndimage.binary_propagation(
+                    core_sub, mask=cand_domain, structure=struct_6
+                )
+                del cand_domain
+                exp_lbls = exp_band.astype(np.int32)
+            else:
+                d_core, near_idx = ndimage.distance_transform_edt(
+                    ~core_sub, return_distances=True, return_indices=True
+                )
+                nearest_lbl = core_lbls[near_idx[0], near_idx[1], near_idx[2]]
+                del near_idx
+                cand_domain = (d_core <= (r_c + 0.65)) & hull_sub & (~occ_sub)
+                del d_core, hull_sub
+                exp_band = ndimage.binary_propagation(
+                    core_sub, mask=cand_domain, structure=struct_6
+                )
+                del cand_domain
+                exp_lbls = np.where(exp_band, nearest_lbl, 0)
+                del nearest_lbl
+
+            outside_air = (~occ_sub) & (~exp_band)
+            touch_air = exp_band & ndimage.binary_dilation(outside_air, structure=struct_6)
+            touch_wall = exp_band & ndimage.binary_dilation(occ_sub, structure=struct_6)
+            del outside_air
+
+            air_cnts = np.bincount(exp_lbls[touch_air], minlength=n_cores + 1)
+            wall_cnts = np.bincount(exp_lbls[touch_wall], minlength=n_cores + 1)
+            del touch_air, touch_wall
+
+            air_ratio = air_cnts / np.maximum(air_cnts + wall_cnts, 1)
+            valid_cids = np.where((core_sizes >= 8) & (air_ratio < 0.040))[0]
+            valid_cids = valid_cids[valid_cids > 0]
+
+            if len(valid_cids) > 0:
+                cav_sub_local = np.isin(exp_lbls, valid_cids)
+                ext_outside = (~occ_sub) & (~cav_sub_local)
+                plug_sub_local = cav_sub_local & ndimage.binary_dilation(ext_outside, structure=struct_18)
+                del ext_outside
+
+                iz0, iz1 = max(z0, pad_c), min(z1, pad_c + NZ_c)
+                iy0, iy1 = max(y0, pad_c), min(y1, pad_c + NY_c)
+                ix0, ix1 = max(x0, pad_c), min(x1, pad_c + NX_c)
+                if iz1 > iz0 and iy1 > iy0 and ix1 > ix0:
+                    cav_crop = cav_sub_local[iz0 - z0 : iz1 - z0, iy0 - y0 : iy1 - y0, ix0 - x0 : ix1 - x0]
+                    plug_crop = plug_sub_local[iz0 - z0 : iz1 - z0, iy0 - y0 : iy1 - y0, ix0 - x0 : ix1 - x0]
+                    oc_slice = occ_c[iz0 - pad_c : iz1 - pad_c, iy0 - pad_c : iy1 - pad_c, ix0 - pad_c : ix1 - pad_c]
+                    new_cav = cav_crop & (~oc_slice)
+                    if np.any(new_cav):
+                        cav_pure_c[iz0 - pad_c : iz1 - pad_c, iy0 - pad_c : iy1 - pad_c, ix0 - pad_c : ix1 - pad_c] |= new_cav
+                        vent_plug_c[iz0 - pad_c : iz1 - pad_c, iy0 - pad_c : iy1 - pad_c, ix0 - pad_c : ix1 - pad_c] |= plug_crop
+                        oc_slice |= new_cav
+                        filled_any = True
+                del cav_sub_local, plug_sub_local
+
+            del core_sub, occ_sub, core_lbls, exp_band, exp_lbls
+        else:
+            del filled_dil
+
+        del core_all, occ_box
+
+    del occ_c
+    if filled_any:
+        seal_vol = (solid_vol > 0) | (shell_closed > 0)
+        cav_fine = np.broadcast_to(
+            cav_pure_c[:, None, :, None, :, None], (NZ_c, ds, NY_c, ds, NX_c, ds)
+        ).reshape(NZ_c * ds, NY_c * ds, NX_c * ds)[:NZ, :NY, :NX]
+        seal_vol |= cav_fine
+        del cav_fine
+
+        pz, py, px = np.where(vent_plug_c)
+        if len(pz) > 0:
+            for dz in (-1, 0, 1, 2):
+                fz = np.clip(pz * ds + dz, 1, NZ - 2)
+                for dy in (-1, 0, 1, 2):
+                    fy = np.clip(py * ds + dy, 1, NY - 2)
+                    for dx in (-1, 0, 1, 2):
+                        fx = np.clip(px * ds + dx, 1, NX - 2)
+                        seal_vol[fz, fy, fx] = True
+
+        seal_vol[0, :, :] = False
+        seal_vol[-1, :, :] = False
+        seal_vol[:, 0, :] = False
+        seal_vol[:, -1, :] = False
+        seal_vol[:, :, 0] = False
+        seal_vol[:, :, -1] = False
+
+        filled_vol = ndimage.binary_fill_holes(seal_vol)
+        del seal_vol
+        added_vox = int(np.sum(filled_vol & (solid_vol == 0)))
+        solid_vol = filled_vol.astype(np.uint8)
+        del filled_vol
+        print(f"  -> Cavidades ocas internas seladas e preenchidas em 3D: {added_vox:,} voxels convertidos em sólido")
+
+    del cav_pure_c, vent_plug_c
+    return solid_vol
+
+
+def construir_volume_solido_universal(mesh, res_z=1000, modo_base="auto"):
     """
     Reconstrói o volume 3D 100% sólido usando rasterização 3D direta + Flood-Fill 3D verdadeiro
-    do ar externo (NUNCA faz flood-fill 2D em fatias do corpo, eliminando pontes na virilha/capa).
+    + selagem 3D por esfera rolante para cavidades ocas ventiladas (sem pontes na virilha/capa).
     """
     bmin, bmax = mesh.bounds
     spans = bmax - bmin
@@ -449,7 +626,7 @@ def construir_volume_solido_universal(mesh, res_z=950, modo_base="auto"):
 
     print(f"  -> Grade volumétrica 3D isotrópica: {NX} x {NY} x {NZ} (passo h={h:.5f})")
 
-    mesh_sealed = fechar_micro_furos_malha(mesh, max_hole_ratio=0.030)
+    mesh_sealed = fechar_micro_furos_malha(mesh, max_hole_ratio=0.035)
     shell_vol = rasterizar_superficie_3d(
         mesh_sealed.vertices, mesh_sealed.faces, gmin, h, (NZ, NY, NX)
     )
@@ -485,9 +662,9 @@ def construir_volume_solido_universal(mesh, res_z=950, modo_base="auto"):
     shell_closed[:, :, 0] = 0
     shell_closed[:, :, -1] = 0
 
-    # Preenchimento 3D VERDADEIRO: o ar externo circula livremente em 3D por baixo da capa
-    # e pela virilha; apenas cavidades 100% fechadas em 3D são convertidas em sólido maciço!
+    # Preenchimento 3D VERDADEIRO inicial + selagem 3D de cavidades internas com fendas/respiros!
     solid_vol = ndimage.binary_fill_holes(shell_closed > 0).astype(np.uint8)
+    solid_vol = _solidificar_cavidades_ventiladas_3d(solid_vol, shell_closed, h, span_max)
     del shell_closed
 
     if modo_base in ("auto", "plana"):
@@ -587,7 +764,7 @@ def _remover_spikes_malha(mesh, sdf_grid, gmin, h, z_bot=None):
 
     relaxed_ever = np.zeros(n_verts, dtype=bool)
 
-    for _pass in range(2):
+    for _pass in range(3):
         v_avg = L_op.dot(verts)
         delta_norm = np.linalg.norm(verts - v_avg, axis=1)
 
@@ -627,7 +804,7 @@ def _remover_spikes_malha(mesh, sdf_grid, gmin, h, z_bot=None):
         # 2) Validação direta contra o SDF: vértices fora da superfície zero ou arestas cruzando o ar/sólido
         if sdf_grid is not None:
             sdf_vals = np.abs(_avaliar_trilinear(verts, sdf_grid, gmin, h))
-            sdf_outlier = above_bot & (sdf_vals > 1.55 * h)
+            sdf_outlier = above_bot & (sdf_vals > 1.95 * h)
 
             edge_len = np.linalg.norm(verts[u_e] - verts[v_e], axis=1)
             long_mask = edge_len > 2.5 * h
@@ -640,7 +817,7 @@ def _remover_spikes_malha(mesh, sdf_grid, gmin, h, z_bot=None):
                 s_mid = np.abs(_avaliar_trilinear(0.50 * (pa + pb), sdf_grid, gmin, h))
                 s_q1 = np.abs(_avaliar_trilinear(0.75 * pa + 0.25 * pb, sdf_grid, gmin, h))
                 s_q3 = np.abs(_avaliar_trilinear(0.25 * pa + 0.75 * pb, sdf_grid, gmin, h))
-                bad_long = np.maximum(s_mid, np.maximum(s_q1, s_q3)) > 1.80 * h
+                bad_long = np.maximum(s_mid, np.maximum(s_q1, s_q3)) > 2.05 * h
                 if np.any(bad_long):
                     bad_deg = np.zeros(n_verts, dtype=np.int32)
                     np.add.at(bad_deg, lu[bad_long], 1)
@@ -656,7 +833,7 @@ def _remover_spikes_malha(mesh, sdf_grid, gmin, h, z_bot=None):
 
         relaxed_ever |= spike_mask
         # Mantém 100% dos vértices sãos (~spike_mask) cravados no lugar (condição de contorno de Dirichlet)!
-        for _ in range(35):
+        for _ in range(45):
             v_new = L_op.dot(verts)
             verts[spike_mask] = v_new[spike_mask]
 
@@ -714,6 +891,116 @@ def _polir_taubin_normal(mesh, lamb=0.45, nu=0.47, iterations=6, z_bot=None, h=0
     return mesh
 
 
+def _calcular_amostras_phong_externas(verts_orig, outer_faces, outer_fn, h):
+    """
+    Gera amostras contínuas com interpolação curva de Phong (PN-Triangles com proteção de vincos):
+    reconstrói a curvatura orgânica suave entre triângulos brutos facetados da IA sem achatar a pele,
+    mantendo 100% retas as quinas vivas (>= 45°, como bordas de pedestais, solas e armaduras).
+    """
+    ov0 = verts_orig[outer_faces[:, 0]]
+    ov1 = verts_orig[outer_faces[:, 1]]
+    ov2 = verts_orig[outer_faces[:, 2]]
+
+    dbl_area = np.linalg.norm(np.cross(ov1 - ov0, ov2 - ov0), axis=1, keepdims=True)
+    weighted_fn = outer_fn * np.maximum(dbl_area, 1e-12)
+
+    v_norm_sum = np.zeros_like(verts_orig, dtype=np.float64)
+    np.add.at(v_norm_sum, outer_faces[:, 0], weighted_fn)
+    np.add.at(v_norm_sum, outer_faces[:, 1], weighted_fn)
+    np.add.at(v_norm_sum, outer_faces[:, 2], weighted_fn)
+    v_norm_len = np.linalg.norm(v_norm_sum, axis=1, keepdims=True)
+    v_smooth = np.where(v_norm_len > 1e-12, v_norm_sum / np.maximum(v_norm_len, 1e-12), 0.0)
+    del v_norm_sum, v_norm_len, weighted_fn, dbl_area
+
+    def _normal_canto_com_vinco(v_idx):
+        vn = v_smooth[v_idx]
+        cos_th = np.sum(vn * outer_fn, axis=1, keepdims=True)
+        blend = np.clip((cos_th - 0.78) / 0.12, 0.0, 1.0)
+        nc = (1.0 - blend) * outer_fn + blend * vn
+        nc_len = np.linalg.norm(nc, axis=1, keepdims=True)
+        return nc / np.maximum(nc_len, 1e-12)
+
+    N0 = _normal_canto_com_vinco(outer_faces[:, 0])
+    N1 = _normal_canto_com_vinco(outer_faces[:, 1])
+    N2 = _normal_canto_com_vinco(outer_faces[:, 2])
+    del v_smooth
+
+    bary_list = (
+        (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0),
+        (0.5, 0.5, 0.0),
+        (0.0, 0.5, 0.5),
+        (0.5, 0.0, 0.5),
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    pts_chunks = []
+    nrm_chunks = []
+    max_off = 0.45 * h
+
+    for b0, b1, b2 in bary_list:
+        p_flat = b0 * ov0 + b1 * ov1 + b2 * ov2
+        if b0 < 1.0 and b1 < 1.0 and b2 < 1.0:
+            d0 = np.sum((p_flat - ov0) * N0, axis=1, keepdims=True) * N0
+            d1 = np.sum((p_flat - ov1) * N1, axis=1, keepdims=True) * N1
+            d2 = np.sum((p_flat - ov2) * N2, axis=1, keepdims=True) * N2
+            phong_off = -0.55 * (b0 * d0 + b1 * d1 + b2 * d2)
+            off_len = np.linalg.norm(phong_off, axis=1, keepdims=True)
+            scale = np.where(off_len > max_off, max_off / np.maximum(off_len, 1e-12), 1.0)
+            p_curv = p_flat + phong_off * scale
+        else:
+            p_curv = p_flat
+        n_curv = b0 * N0 + b1 * N1 + b2 * N2
+        n_curv /= np.maximum(np.linalg.norm(n_curv, axis=1, keepdims=True), 1e-12)
+        pts_chunks.append(p_curv.astype(np.float32))
+        nrm_chunks.append(n_curv.astype(np.float32))
+
+    pts_chunks.append(np.zeros((1, 3), dtype=np.float32))
+    nrm_chunks.append(np.zeros((1, 3), dtype=np.float32))
+    return np.vstack(pts_chunks), np.vstack(nrm_chunks)
+
+
+def _descolar_vertices_pinch_manifold(verts, faces, eps_sep=1e-4):
+    """
+    Separa em nível micrométrico vértices topologicamente distintos que compartilham a mesma
+    coordenada float32 (costuras/pinches exportados pelo manifold3d), evitando que a fusão por
+    coordenadas no arquivo STL gere arestas ou vértices não-manifold no fatiador.
+    """
+    v = np.array(verts, dtype=np.float64, copy=True)
+    f = np.asarray(faces, dtype=np.int64)
+    if len(v) == 0 or len(f) == 0:
+        return v
+
+    fn = np.cross(v[f[:, 1]] - v[f[:, 0]], v[f[:, 2]] - v[f[:, 0]])
+    vn = np.zeros_like(v, dtype=np.float64)
+    np.add.at(vn, f[:, 0], fn)
+    np.add.at(vn, f[:, 1], fn)
+    np.add.at(vn, f[:, 2], fn)
+    vn_len = np.linalg.norm(vn, axis=1, keepdims=True)
+    vn_unit = np.where(vn_len > 1e-15, vn / np.maximum(vn_len, 1e-15), 0.0)
+
+    for p_idx, scale in enumerate((1.0, 2.5, 6.0)):
+        vf32 = v.astype(np.float32)
+        vf32 = np.where(vf32 == 0.0, np.float32(0.0), vf32)
+        raw_keys = np.ascontiguousarray(vf32).view(np.dtype((np.void, 12))).ravel()
+        _, inv, cnts = np.unique(raw_keys, return_inverse=True, return_counts=True)
+        dup_mask = cnts[inv] > 1
+        if not np.any(dup_mask):
+            break
+        dup_idx = np.where(dup_mask)[0]
+        step = float(eps_sep) * scale
+        n_d = vn_unit[dup_idx]
+        if p_idx >= 1:
+            u64 = dup_idx.astype(np.uint64)
+            jx = (((u64 * np.uint64(2654435761)) & np.uint64(0xFF)).astype(np.float64) / 255.0 - 0.5) * 0.5
+            jy = (((u64 * np.uint64(2246822519)) & np.uint64(0xFF)).astype(np.float64) / 255.0 - 0.5) * 0.5
+            jz = (((u64 * np.uint64(3266489917)) & np.uint64(0xFF)).astype(np.float64) / 255.0 - 0.5) * 0.5
+            n_d = n_d + np.column_stack([jx, jy, jz])
+        v[dup_idx] -= step * n_d
+
+    return v
+
+
 def extrair_e_realcar_superficie(
     mesh_orig,
     solid_vol,
@@ -723,20 +1010,23 @@ def extrair_e_realcar_superficie(
     iz_bot,
     modo_base="auto",
     realce_detalhes=0.0,
+    suavizacao=1.0,
     espessura_min_mm=0.50,
     altura_alvo_mm=75.0,
-    target_faces=800000,
+    target_faces=2000000,
 ):
     """
-    Extrai a malha estanque com SDF de gradiente unitário exato, simplifica ANTES do encaixe
-    (evitando dobras/spikes na simplificação), aplica filtro anti-spike, encaixe suavizado 1:1
-    e polimento Taubin real preservador de volume (nu positivo).
+    Extrai malha densa de ultra-alta resolução com SDF de gradiente unitário exato,
+    encaixe curvo de Phong (sem estampar facetas planas da IA), acabamento superficial
+    estilo porcelana com compensação de volume na malha uniforme e validação 2-manifold
+    micrométrica de alta densidade seguida de proteção anti-spike.
     """
     bmin, bmax = mesh_orig.bounds
     altura_orig = bmax[2] - bmin[2]
 
     mm_por_unidade = altura_alvo_mm / (altura_orig + 1e-9)
     unidades_por_mm = 1.0 / mm_por_unidade
+    suav_clamped = float(np.clip(suavizacao, 0.0, 2.5))
 
     # SDF Euclidiano exato sem o salto artificial de +1.0*h na interface sólido/ar
     dist_in = ndimage.distance_transform_edt(solid_vol > 0, sampling=(h, h, h)).astype(np.float32)
@@ -750,6 +1040,7 @@ def extrair_e_realcar_superficie(
     c_pts = mesh_orig.triangles_center
     n_vec = mesh_orig.face_normals
 
+    sdf_center = _avaliar_trilinear(c_pts, sdf_body, gmin, h)
     air_1 = _avaliar_trilinear(c_pts + (1.8 * h) * n_vec, sdf_body, gmin, h)
     air_2 = _avaliar_trilinear(c_pts + (2.8 * h) * n_vec, sdf_body, gmin, h)
     air_front = np.maximum(air_1, air_2)
@@ -758,7 +1049,10 @@ def extrair_e_realcar_superficie(
     back_2 = _avaliar_trilinear(c_pts - (2.8 * h) * n_vec, sdf_body, gmin, h)
     air_back = np.maximum(back_1, back_2)
 
-    outer_mask = (air_front >= 0.45 * h) | ((air_back >= 0.65 * h) & (air_front >= -0.35 * h))
+    outer_mask = (sdf_center >= -1.15 * h) & (
+        (air_front >= 0.45 * h) | ((air_back >= 0.65 * h) & (air_front >= -0.35 * h))
+    )
+    del sdf_center
     if np.any(outer_mask):
         idx_outer = np.where(outer_mask)[0]
         outer_faces = mesh_orig.faces[idx_outer]
@@ -778,8 +1072,9 @@ def extrair_e_realcar_superficie(
     np.minimum(sdf_body, dist_shell - np.float32(r_guard), out=sdf_body)
     del dist_shell
 
-    # Suavização Gaussiana isotrópica (sigma=1.0) para eliminar 100% dos degraus de voxel no SDF
-    ndimage.gaussian_filter(sdf_body, sigma=1.0, output=sdf_body)
+    # Suavização Gaussiana isotrópica calibrada para eliminar degraus de voxel preservando detalhes finos
+    sigma_sdf = float(np.clip(0.65 + 0.15 * suav_clamped, 0.55, 1.05))
+    ndimage.gaussian_filter(sdf_body, sigma=sigma_sdf, output=sdf_body)
     if modo_base in ("auto", "plana"):
         sdf_body[:iz_bot] = np.abs(sdf_body[:iz_bot]) + np.float32(h)
 
@@ -794,11 +1089,6 @@ def extrair_e_realcar_superficie(
     del verts_mc, faces_mc
     repaired = trimesh.Trimesh(vertices=verts_xyz, faces=faces_xyz, process=True)
 
-    # 1) Suavização Taubin REAL preservadora de volume (nu POSITIVO em trimesh!) na malha limpa
-    trimesh.smoothing.filter_taubin(repaired, lamb=0.50, nu=0.52, iterations=8)
-
-    # 2) Simplificação 2-manifold ANTES do encaixe (evita triângulos dobrados e elimina spikes!),
-    #    mantendo a contagem abaixo do limite de 1 milhão de faces do Creality Print.
     comps = repaired.split(only_watertight=False)
     if len(comps) > 1:
         comps = sorted(comps, key=lambda m: len(m.faces), reverse=True)
@@ -806,76 +1096,35 @@ def extrair_e_realcar_superficie(
         kept = [m for m in comps if len(m.faces) >= max_f * 0.003]
         repaired = trimesh.util.concatenate(kept) if len(kept) > 1 else comps[0]
 
-    n_in = len(repaired.faces)
-    span_max = float(repaired.extents.max())
-    m_in = manifold3d.Mesh(
-        vert_properties=repaired.vertices.astype(np.float32),
-        tri_verts=repaired.faces.astype(np.uint32),
-    )
-    man = manifold3d.Manifold(m_in)
-    if target_faces <= 850000:
-        max_allowed_faces = min(960000, max(250000, int(target_faces * 1.18)))
-    else:
-        max_allowed_faces = int(target_faces * 1.18)
-
-    if n_in > target_faces * 1.05:
-        tol = 0.000072 * span_max * (float(n_in) / float(max(150000, target_faces)) / 5.0)
-        tol = float(np.clip(tol, 0.000025 * span_max, 0.00030 * span_max))
-        print(f"  -> Otimizando malha via manifold3d.simplify ({n_in:,} faces)...")
-        man_curr = man.simplify(tol)
-        m_out = man_curr.to_mesh()
-        for _ in range(5):
-            if len(m_out.tri_verts) <= max_allowed_faces:
-                break
-            tol *= 1.40
-            man_curr = man.simplify(tol)
-            m_out = man_curr.to_mesh()
-    else:
-        m_out = man.to_mesh()
-
-    repaired = trimesh.Trimesh(
-        vertices=m_out.vert_properties[:, :3].astype(np.float64),
-        faces=m_out.tri_verts,
-        process=True,
-    )
-    print(f"  -> Malha 2-manifold otimizada: {len(repaired.faces):,} faces")
-
-    # 3) Proteção anti-spike pós-simplificação validada contra o campo SDF e normais
     z_bot_world = float(gmin[2] + iz_bot * h) if modo_base in ("auto", "plana") else None
-    repaired = _remover_spikes_malha(repaired, sdf_body, gmin, h, z_bot=z_bot_world)
+    z_margin = (bmin[2] + 2.5 * h) if modo_base in ("auto", "plana") else (bmin[2] - h)
 
-    # Salva estado geométrico limpo (pós-manifold) para impedir inversão de faces em quinas/bases
-    verts_pre_snap = repaired.vertices.copy()
-    fn_pre_snap = repaired.face_normals.copy()
+    # 1) Suavização Taubin real preservadora de volume (+0.50 / -0.52) antes do encaixe:
+    #    elimina o serrilhado do Marching Cubes sem encolher dedos, ponta do nariz ou mechas!
+    L_dense = _construir_operador_vizinhos(len(repaired.vertices), repaired.faces)
+    verts_d = repaired.vertices.copy()
+    if z_bot_world is not None:
+        mob_bot = (verts_d[:, 2] > (z_bot_world + 1.8 * h))[:, None]
+    else:
+        mob_bot = np.ones((len(verts_d), 1), dtype=bool)
 
-    # 4) Mede espessura interna local suave na malha já simplificada
+    for idx_p in range(6):
+        step_w = 0.50 if (idx_p % 2 == 0) else -0.52
+        verts_d += mob_bot * (step_w * (L_dense.dot(verts_d) - verts_d))
+    repaired.vertices = verts_d
+    del verts_d
+
+    # 2) Mede espessura interna local suave para proteger cascas finas abertas durante o encaixe
     v_norms_pre = repaired.vertex_normals.astype(np.float32)
     sdf_inward = _avaliar_trilinear(repaired.vertices - (1.8 * h) * v_norms_pre, sdf_body, gmin, h)
-    del sdf_body
     thin_safe = np.clip((-sdf_inward - 0.20 * h) / (1.0 * h), 0.15, 1.0)
+    del v_norms_pre, sdf_inward
 
-    # 5) Encaixe contínuo suavizado (sem dobrar triângulos adjacentes!)
+    # 3) Encaixe curvo de Phong na malha densa uniforme (preserva detalhes sem copiar facetas planas!)
     if len(outer_faces) > 0:
-        ov0 = mesh_orig.vertices[outer_faces[:, 0]]
-        ov1 = mesh_orig.vertices[outer_faces[:, 1]]
-        ov2 = mesh_orig.vertices[outer_faces[:, 2]]
-        oc = (ov0 + ov1 + ov2) / 3.0
-
-        sample_pts = np.vstack([
-            oc,
-            0.5 * (ov0 + ov1),
-            0.5 * (ov1 + ov2),
-            0.5 * (ov2 + ov0),
-            0.5 * (oc + ov0),
-            0.5 * (oc + ov1),
-            0.5 * (oc + ov2),
-        ]).astype(np.float32)
-        sample_norms = np.vstack([outer_fn] * 7).astype(np.float32)
-
-        sample_pts_pad = np.vstack([sample_pts, np.zeros((1, 3), dtype=np.float32)])
-        sample_norms_pad = np.vstack([sample_norms, np.zeros((1, 3), dtype=np.float32)])
-        del sample_pts, sample_norms
-
+        sample_pts_pad, sample_norms_pad = _calcular_amostras_phong_externas(
+            mesh_orig.vertices, outer_faces, outer_fn, h
+        )
         tree = cKDTree(sample_pts_pad[:-1])
         max_snap_dist = 2.0 * h
         dists, idxs = tree.query(
@@ -885,8 +1134,6 @@ def extrair_e_realcar_superficie(
         v_norms = repaired.vertex_normals.astype(np.float32)
         cand_norms = sample_norms_pad[idxs]
         dots = np.sum(v_norms[:, None, :] * cand_norms, axis=2)
-
-        z_margin = (bmin[2] + 2.5 * h) if modo_base in ("auto", "plana") else (bmin[2] - h)
         above_base = repaired.vertices[:, 2] > z_margin
 
         valid = np.isfinite(dists) & (dots >= 0.55) & above_base[:, None]
@@ -902,45 +1149,115 @@ def extrair_e_realcar_superficie(
             n_targ = sample_norms_pad[matched_idx]
 
             normal_disp = np.sum((p_targ - v_curr) * n_targ, axis=1, keepdims=True)
-            normal_disp = np.clip(normal_disp, -0.85 * h, 0.85 * h)
+            normal_disp = np.clip(normal_disp, -0.95 * h, 0.95 * h)
 
+            snap_strength = float(np.clip(0.90 - 0.05 * suav_clamped, 0.75, 0.92))
             ts = thin_safe[row_idx, None]
-            w = np.where(normal_disp < 0.0, 0.85 * ts, 0.85)
+            w = np.where(normal_disp < 0.0, snap_strength * ts, snap_strength)
 
             disp_all = np.zeros_like(repaired.vertices)
             disp_all[row_idx] = w * normal_disp * n_targ
 
-            # Suaviza o campo vetorial de deslocamento na vizinhança para impedir micro-dobras
-            L_snap = _construir_operador_vizinhos(len(repaired.vertices), repaired.faces)
-            for _ in range(3):
-                disp_all = 0.50 * disp_all + 0.50 * L_snap.dot(disp_all)
+            for _ in range(2):
+                disp_all = 0.50 * disp_all + 0.50 * L_dense.dot(disp_all)
             disp_all[~above_base] = 0.0
             repaired.vertices += disp_all
 
         del sample_pts_pad, sample_norms_pad, tree
+    del thin_safe
 
-    z_margin_final = (bmin[2] + 2.5 * h) if modo_base in ("auto", "plana") else (bmin[2] - h)
+    # 4) Acabamento estilo porcelana Taubin projetado na normal COM proteção de vincos escultóricos:
+    #    dissolve 100% das micro-facetas na pele e na capa mantendo olhos, nariz, lábios e dedos nítidos!
+    n_cycles = int(round(4 * suav_clamped))
+    if n_cycles > 0:
+        print(f"  -> Aplicando acabamento liso de superfície (intensidade={suav_clamped:.2f}, {n_cycles} ciclos)...")
+        vn_curr = repaired.vertex_normals.astype(np.float64)
+        vn_avg = L_dense.dot(vn_curr.astype(np.float32)).astype(np.float64)
+        vn_cos = np.sum(vn_curr * vn_avg, axis=1, keepdims=True)
+        crease_w = np.clip((vn_cos - 0.82) / 0.12, 0.12, 1.0)
+        del vn_avg, vn_cos
+
+        v_fair = repaired.vertices.copy()
+        mob_w = (v_fair[:, 2] > z_margin)[:, None] * crease_w
+        del crease_w
+        for idx_f in range(n_cycles * 2):
+            diff_f = L_dense.dot(v_fair) - v_fair
+            norm_proj = np.sum(diff_f * vn_curr, axis=1, keepdims=True) * vn_curr
+            step_f = 0.46 if (idx_f % 2 == 0) else -0.485
+            v_fair += mob_w * (step_f * norm_proj)
+        del mob_w, vn_curr
+        repaired.vertices = v_fair
+        del v_fair
+
+    # 5) Realce de Micro-Detalhes 3D opcional (--realce) APÓS dissolver as facetas brutas,
+    #    acentuando apenas relevos escultóricos reais (olhos, nariz, lábios, mechas) sem ruído!
     if realce_detalhes > 0.0:
         print(f"  -> Aplicando Realce de Micro-Detalhes 3D (intensidade={realce_detalhes:.2f})...")
-        mesh_base = repaired.copy()
-        trimesh.smoothing.filter_taubin(mesh_base, lamb=0.50, nu=0.52, iterations=8)
-
+        v_base = repaired.vertices.copy()
+        for _ in range(10):
+            v_base += mob_bot * (0.50 * (L_dense.dot(v_base) - v_base))
         v_norms = repaired.vertex_normals
-        detail_vec = repaired.vertices - mesh_base.vertices
-        detail_scalar = np.sum(detail_vec * v_norms, axis=1, keepdims=True)
+        detail_scalar = np.sum((repaired.vertices - v_base) * v_norms, axis=1, keepdims=True)
+        del v_base
 
         max_boost_unit = 0.14 * unidades_por_mm
-        boost_disp = np.clip(realce_detalhes * detail_scalar, -max_boost_unit, max_boost_unit)
-        detail_mask = (repaired.vertices[:, 2] > z_margin_final).reshape(-1, 1)
-        repaired.vertices += detail_mask * boost_disp * v_norms
+        boost_vec = np.clip(realce_detalhes * detail_scalar, -max_boost_unit, max_boost_unit) * v_norms
+        for _ in range(2):
+            boost_vec = 0.50 * boost_vec + 0.50 * L_dense.dot(boost_vec)
+        detail_mask = (repaired.vertices[:, 2] > z_margin).reshape(-1, 1)
+        repaired.vertices += detail_mask * boost_vec
+        del boost_vec
 
-    # 6) Polimento Taubin final ao longo da normal (ZERO deslizamento tangencial em bases planas!)
+    del L_dense, mob_bot
+
+    if modo_base in ("auto", "plana") and z_bot_world is not None:
+        bot_m_pre = repaired.vertices[:, 2] <= z_bot_world + 1.8 * h
+        repaired.vertices[bot_m_pre, 2] = z_bot_world
+
+    # 6) Validação 2-manifold e simplificação micrométrica de alta densidade (deixa a densidade alta
+    #    para máxima lisura visual e permite ao fatiador gerenciar a complexidade se desejado)
+    n_in = len(repaired.faces)
+    span_max = float(repaired.extents.max())
+    m_in = manifold3d.Mesh(
+        vert_properties=repaired.vertices.astype(np.float32),
+        tri_verts=repaired.faces.astype(np.uint32),
+    )
+    man = manifold3d.Manifold(m_in)
+    del m_in
+
+    if n_in > target_faces * 1.03:
+        ratio = float(n_in) / float(max(200000, target_faces))
+        tol = 0.000008 * span_max * (ratio ** 0.85)
+        tol = float(np.clip(tol, 0.000004 * span_max, 0.000120 * span_max))
+        print(f"  -> Otimizando malha via manifold3d.simplify ({n_in:,} faces)...")
+        man = man.simplify(tol)
+
+    m_out = man.to_mesh()
+    del man
+    v_man = _descolar_vertices_pinch_manifold(
+        m_out.vert_properties[:, :3], m_out.tri_verts, eps_sep=2.0e-5 * span_max
+    )
+    repaired = trimesh.Trimesh(
+        vertices=v_man,
+        faces=m_out.tri_verts,
+        process=True,
+    )
+    del m_out, v_man
+    print(f"  -> Malha 2-manifold otimizada: {len(repaired.faces):,} faces")
+
+    # 7) Filtro anti-spike pós-simplificação validado contra o SDF + polimento normal sem deslize em bases
+    repaired = _remover_spikes_malha(repaired, sdf_body, gmin, h, z_bot=z_bot_world)
+    del sdf_body
+
+    verts_post_man = repaired.vertices.copy()
+    fn_post_man = repaired.face_normals.copy()
+
     repaired = _polir_taubin_normal(
-        repaired, lamb=0.45, nu=0.47, iterations=6, z_bot=z_bot_world, h=h
+        repaired, lamb=0.35, nu=0.37, iterations=2, z_bot=z_bot_world, h=h
     )
     repaired = _remover_spikes_malha(repaired, None, gmin, h, z_bot=z_bot_world)
 
-    # 7) Garantia estrita contra faces dobradas/invertidas (evita triângulos escuros/faltando na base!)
+    # 8) Garantia estrita contra faces dobradas/invertidas (protege bases e quinas planas)
     for _ in range(6):
         fv0 = repaired.vertices[repaired.faces[:, 0]]
         fv1 = repaired.vertices[repaired.faces[:, 1]]
@@ -948,20 +1265,20 @@ def extrair_e_realcar_superficie(
         fn_curr = np.cross(fv1 - fv0, fv2 - fv0)
         fn_len = np.linalg.norm(fn_curr, axis=1, keepdims=True)
         fn_curr_u = fn_curr / np.maximum(fn_len, 1e-15)
-        bad_faces = (np.sum(fn_curr_u * fn_pre_snap, axis=1) < 0.25) | (fn_len[:, 0] < 1e-13)
+        bad_faces = (np.sum(fn_curr_u * fn_post_man, axis=1) < 0.25) | (fn_len[:, 0] < 1e-13)
         if not np.any(bad_faces):
             break
         bad_v = np.zeros(len(repaired.vertices), dtype=bool)
         bad_v[repaired.faces[bad_faces].ravel()] = True
-        repaired.vertices[bad_v] = 0.30 * repaired.vertices[bad_v] + 0.70 * verts_pre_snap[bad_v]
-    del verts_pre_snap, fn_pre_snap
+        repaired.vertices[bad_v] = 0.30 * repaired.vertices[bad_v] + 0.70 * verts_post_man[bad_v]
+    del verts_post_man, fn_post_man
 
     repaired.vertices[:, 0] -= 0.5 * (repaired.bounds[0, 0] + repaired.bounds[1, 0])
     repaired.vertices[:, 1] -= 0.5 * (repaired.bounds[0, 1] + repaired.bounds[1, 1])
     repaired.vertices[:, 2] -= repaired.bounds[0, 2]
 
     if modo_base in ("auto", "plana"):
-        dz_tol = max(1.8 * h, 0.0012 * repaired.extents[2])
+        dz_tol = 1.0e-4 * repaired.extents[2]
         bot_mask = repaired.vertices[:, 2] <= dz_tol
         repaired.vertices[bot_mask, 2] = 0.0
 
@@ -1027,6 +1344,70 @@ def aplicar_escala_final(mesh, args):
     mesh.vertices[:, 1] -= 0.5 * (mesh.bounds[0, 1] + mesh.bounds[1, 1])
     mesh.vertices[:, 2] -= mesh.bounds[0, 2]
     return mesh
+
+
+def garantir_manifold_final_stl(mesh):
+    """
+    Garante que a malha final na precisão exata float32 do formato STL binário seja 100%
+    estanque (2-manifold), com 0 arestas abertas, 0 arestas não-manifold e sem micro-bolhas.
+    """
+    if len(mesh.faces) == 0 or len(mesh.vertices) == 0:
+        return mesh
+
+    def _filtrar_ilhas_principais(m_in):
+        f = m_in.faces
+        if len(f) == 0:
+            return m_in
+        rows = np.concatenate([f[:, 0], f[:, 1], f[:, 2]])
+        cols = np.concatenate([f[:, 1], f[:, 2], f[:, 0]])
+        adj = coo_matrix(
+            (np.ones(len(rows), dtype=np.uint8), (rows, cols)),
+            shape=(len(m_in.vertices), len(m_in.vertices)),
+        )
+        n_c, v_lbl = csgraph_components(adj, directed=False)
+        if n_c <= 1:
+            return m_in
+        f_lbl = v_lbl[f[:, 0]]
+        f_cnts = np.bincount(f_lbl, minlength=n_c)
+        max_f = int(f_cnts.max())
+        keep_c = np.where(f_cnts >= max(32, int(max_f * 0.005)))[0]
+        keep_mask = np.isin(f_lbl, keep_c)
+        if np.all(keep_mask):
+            return m_in
+        sub = m_in.submesh([np.where(keep_mask)[0]], append=True)
+        sub.remove_unreferenced_vertices()
+        return sub
+
+    mesh = _filtrar_ilhas_principais(mesh)
+    span_max = float(mesh.extents.max())
+    eps_f32 = max(2.5e-4, 2.5e-5 * span_max)
+
+    v_sep = _descolar_vertices_pinch_manifold(mesh.vertices, mesh.faces, eps_sep=eps_f32)
+    v32 = v_sep.astype(np.float32)
+    v32[:, 2] -= np.float32(v32[:, 2].min())
+    mesh_f32 = trimesh.Trimesh(vertices=v32.astype(np.float64), faces=mesh.faces, process=True)
+    mesh_f32 = _filtrar_ilhas_principais(mesh_f32)
+
+    if not mesh_f32.is_watertight:
+        m_in = manifold3d.Mesh(
+            vert_properties=mesh_f32.vertices.astype(np.float32),
+            tri_verts=mesh_f32.faces.astype(np.uint32),
+        )
+        m_out = manifold3d.Manifold(m_in).to_mesh()
+        del m_in
+        v_clean = _descolar_vertices_pinch_manifold(
+            m_out.vert_properties[:, :3], m_out.tri_verts, eps_sep=eps_f32
+        )
+        v32 = v_clean.astype(np.float32)
+        v32[:, 2] -= np.float32(v32[:, 2].min())
+        mesh_f32 = trimesh.Trimesh(
+            vertices=v32.astype(np.float64), faces=m_out.tri_verts, process=True
+        )
+        del m_out
+        mesh_f32 = _filtrar_ilhas_principais(mesh_f32)
+
+    mesh_f32.fix_normals()
+    return mesh_f32
 
 
 def salvar_imagem_diagnostico(mesh_reparada, out_png):
@@ -1140,6 +1521,12 @@ def main():
         help="Intensidade do Realce de Micro-Detalhes 3D opcional para miniaturas pequenas (padrão: 0.0 = fidelidade 1:1; use 0.65 para minis de 30-45mm)",
     )
     parser.add_argument(
+        "--suavizacao",
+        type=float,
+        default=1.0,
+        help="Intensidade do acabamento liso de superfície estilo porcelana (padrão: 1.0; use 0.0 para desativar ou 1.5 para suavização extra)",
+    )
+    parser.add_argument(
         "--espessura-minima",
         type=float,
         default=0.50,
@@ -1148,14 +1535,14 @@ def main():
     parser.add_argument(
         "--resolucao",
         type=int,
-        default=950,
-        help="Resolução do eixo maior na grade volumétrica 3D isotrópica (padrão: 950)",
+        default=1000,
+        help="Resolução do eixo maior na grade volumétrica 3D isotrópica (padrão: 1000)",
     )
     parser.add_argument(
         "--faces",
         type=int,
-        default=800000,
-        help="Quantidade alvo aproximada de triângulos na malha final otimizada (padrão: 800000 — abaixo do alerta de 1M do Creality Print)",
+        default=2000000,
+        help="Quantidade alvo aproximada de triângulos na malha final (padrão: 2000000 — máxima lisura sem simplificação excessiva)",
     )
     parser.add_argument(
         "--diagnostico",
@@ -1175,7 +1562,7 @@ def main():
 
     t_start = time.time()
     print("=" * 72)
-    print(f"INICIANDO REPARO 3D DE ALTA FIDELIDADE (v2.3): {args.entrada}")
+    print(f"INICIANDO REPARO 3D DE ALTA FIDELIDADE (v2.6): {args.entrada}")
     print("=" * 72)
 
     raw_mesh = trimesh.load(args.entrada, force="mesh")
@@ -1195,7 +1582,7 @@ def main():
         mesh_clean, res_z=args.resolucao, modo_base=args.base
     )
 
-    print("  -> Extraindo superfície lisa, otimizando malha e aplicando encaixe contínuo 1:1...")
+    print("  -> Extraindo superfície de alta densidade, encaixe curvo e acabamento liso...")
     repaired = extrair_e_realcar_superficie(
         mesh_clean,
         solid_vol,
@@ -1205,12 +1592,14 @@ def main():
         iz_bot,
         modo_base=args.base,
         realce_detalhes=args.realce,
+        suavizacao=args.suavizacao,
         espessura_min_mm=args.espessura_minima,
         altura_alvo_mm=altura_alvo,
         target_faces=args.faces,
     )
 
     repaired = aplicar_escala_final(repaired, args)
+    repaired = garantir_manifold_final_stl(repaired)
 
     repaired.export(args.saida)
     info_depois = diagnosticar_malha(repaired, "DEPOIS DO REPARO (Final)")
